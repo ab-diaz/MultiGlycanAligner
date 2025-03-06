@@ -30,42 +30,56 @@ def animated_spinner(stop_event, message):
 
 
 def run_command_with_progress(cmd, cwd, timeout):
-    """Run command with timeout and progress spinner."""
+    """
+    Run command with timeout and progress spinner.
+    Returns a tuple:
+      (status, stdout_lines, stderr_lines, elapsed_time, returncode)
+    """
     start_time = time.time()
     stop_event = Event()
-    q = Queue()
 
-    def worker():
-        try:
-            result = subprocess.run(
-                cmd,
-                cwd=cwd,
-                check=True,
-                capture_output=True,
-                text=True,
-                timeout=timeout
-            )
-            q.put(("success", result, time.time() - start_time))
-        except subprocess.TimeoutExpired as e:
-            q.put(("timeout", e, time.time() - start_time))
-        except Exception as e:
-            q.put(("error", e, time.time() - start_time))
-        finally:
-            stop_event.set()
+    proc = subprocess.Popen(cmd, cwd=cwd,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            text=True)
 
-    Thread(target=worker, daemon=True).start()
+    stdout_lines = []
+    stderr_lines = []
+
+    def read_stream(stream, collector):
+        while True:
+            line = stream.readline()
+            if not line:
+                break
+            collector.append(line)
+        stream.close()
+
+    # Start threads to read stdout and stderr
+    stdout_thread = Thread(target=read_stream, args=(proc.stdout, stdout_lines))
+    stderr_thread = Thread(target=read_stream, args=(proc.stderr, stderr_lines))
+    stdout_thread.start()
+    stderr_thread.start()
+
     spinner = Thread(target=animated_spinner, args=(stop_event, "Processing..."))
     spinner.start()
 
     try:
-        result_type, result, elapsed = q.get(timeout=timeout + 5)
-    except Exception:
-        result_type, result, elapsed = "timeout", None, time.time() - start_time
-
-    stop_event.set()
-    spinner.join()
-
-    return result_type, result, elapsed
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        stop_event.set()
+        spinner.join()
+        stdout_thread.join()
+        stderr_thread.join()
+        elapsed = time.time() - start_time
+        return "timeout", stdout_lines, stderr_lines, elapsed, proc.returncode
+    else:
+        stop_event.set()
+        spinner.join()
+        stdout_thread.join()
+        stderr_thread.join()
+        elapsed = time.time() - start_time
+        return "success", stdout_lines, stderr_lines, elapsed, proc.returncode
 
 
 def check_gcc():
@@ -97,7 +111,7 @@ def extract_gsalign():
     """Extract GS-align archive."""
     print(f"Extracting {GSALIGN_ARCHIVE}...")
     with tarfile.open(GSALIGN_ARCHIVE, "r:gz") as tar:
-        tar.extractall(path=EXTRACT_DIR, filter='data')
+        tar.extractall(path=EXTRACT_DIR)
     print(f"Extracted GS-align to {EXTRACT_DIR}.")
 
 
@@ -187,36 +201,59 @@ def main():
         pair_output = output_dir / pair_name
         pair_output.mkdir(exist_ok=True)
 
-        cmd = [
-            str(gsalign_executable),
-            "-s1", str(pdb1.resolve()),
-            "-s2", str(pdb2.resolve()),
-            "-n", "1",
-            "-o", "2",
-        ]
+        # If running on Linux, prepend "stdbuf -oL" to force line buffering.
+        if platform.system() == "Linux":
+            cmd = [
+                "stdbuf", "-oL", str(gsalign_executable),
+                "-s1", str(pdb1.resolve()),
+                "-s2", str(pdb2.resolve()),
+                "-n", "1",
+                "-o", "2",
+            ]
+        else:
+            cmd = [
+                str(gsalign_executable),
+                "-s1", str(pdb1.resolve()),
+                "-s2", str(pdb2.resolve()),
+                "-n", "1",
+                "-o", "2",
+            ]
 
         print(f"\nProcessing pair {i}/{total_pairs}: {pdb1.name} vs {pdb2.name}")
         print(f"  Timeout set to: {args.timeout}s")
 
-        try:
-            result_type, result, elapsed = run_command_with_progress(
-                cmd,
-                cwd=str(pair_output),
-                timeout=args.timeout
-            )
+        result_type, stdout_lines, stderr_lines, elapsed, returncode = run_command_with_progress(
+            cmd,
+            cwd=str(pair_output),
+            timeout=args.timeout
+        )
 
-            if result_type == "success":
-                print(f"\r  Successfully processed {pair_name} in {elapsed:.1f}s")
-                print("  Output files:", ', '.join([f.name for f in pair_output.glob('*')]))
-            elif result_type == "timeout":
-                print(f"\r  ⚠️ Timed out after {elapsed:.1f}s")
-                print("  Consider increasing timeout with -t option")
-            elif result_type == "error":
-                print(f"\r  ❌ Failed after {elapsed:.1f}s: {str(result)}")
+        # Combine output lines into strings
+        gs_output = "".join(stdout_lines).strip()
+        err_output = "".join(stderr_lines).strip()
+        # Save output to a file in the pair's folder
+        output_file = pair_output / "gsalign_output.txt"
+        with open(output_file, "w") as f:
+            f.write(gs_output + "\n" + err_output)
 
-        except Exception as e:
-            print(f"\n⚠️ Unexpected error: {str(e)}")
-            continue
+        if result_type == "success" and returncode == 0:
+            print(f"\r  Successfully processed {pair_name} in {elapsed:.1f}s")
+            print("  GS-align output:")
+            print(gs_output)
+            if err_output:
+                print("  GS-align error output:")
+                print(err_output)
+        elif result_type == "success" and returncode != 0:
+            print(f"\r  ❌ Process finished with errors (return code {returncode}) after {elapsed:.1f}s")
+            print("  GS-align output:")
+            print(gs_output)
+            if err_output:
+                print("  GS-align error output:")
+                print(err_output)
+        elif result_type == "timeout":
+            print(f"\r  ⚠️ Timed out after {elapsed:.1f}s")
+            print("  Partial GS-align output:")
+            print(gs_output)
 
     print(f"\n✅ Completed all {total_pairs} pairwise comparisons.")
     print(f"Results saved to: {output_dir}")
